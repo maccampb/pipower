@@ -1,0 +1,1650 @@
+#!/usr/bin/env python3
+"""
+pipower - Raspberry Pi 5 RTC Scheduled Power Management CLI
+===========================================================
+Manages daily wake/sleep power cycles on the Raspberry Pi 5 using
+its built-in PCF85063A real-time clock (RTC) and PMIC wake alarm.
+
+Architecture Overview
+---------------------
+Three systemd units are installed to coordinate shutdown and wake:
+
+  pipower-alarm.service
+      Starts at boot (RemainAfterExit=yes) and stays "active" until
+      the system shuts down. Its ExecStop runs `pipower _pre-shutdown`,
+      which writes the next wake epoch to the RTC wakealarm sysfs file
+      (/sys/class/rtc/rtc0/wakealarm) immediately before halt. This
+      intercepts ALL shutdown paths — scheduled, manual, or emergency.
+
+  pipower-shutdown.timer
+      Fires at the configured sleep_time (OnCalendar, timezone-aware).
+      Triggers pipower-shutdown.service.
+
+  pipower-shutdown.service
+      Calls `systemctl poweroff`, which triggers pipower-alarm.service
+      ExecStop as part of the normal shutdown sequence.
+
+Wake Mechanism
+--------------
+Writing a UTC epoch integer to /sys/class/rtc/rtc0/wakealarm programs
+the Pi 5 PMIC to restore power at that time. The system must be halted
+(not suspended) and external 5V power must remain present. The RTC
+battery (J5 connector) maintains timekeeping only — it does not power
+the board during halt.
+
+Time Synchronization
+--------------------
+chrony disciplines the system clock against NRC stratum-2 atomic clock
+servers (time.nrc.ca, time.chu.nrc.ca) and Cloudflare NTS. The
+`rtcsync` chrony directive writes the NTP-corrected time back to the
+hardware RTC every 11 minutes, ensuring wake alarm epochs are accurate.
+
+Version: V2.0
+Changelog:
+  V2.3 - BUGFIX: Root cause of immediate shutdown identified and fixed.
+         Removed `Requires=pipower-shutdown.service` from timer [Unit]
+         section. systemd activates Requires= dependencies immediately
+         when the unit starts — causing pipower-shutdown.service to run
+         systemctl poweroff the instant `pipower enable` was called.
+         Also removed redundant `Unit=` from [Timer] — systemd auto-links
+         pipower-shutdown.timer to pipower-shutdown.service by name.
+  V2.2 - BUGFIX: Removed OnBootSec=2min from timer unit. When OnBootSec
+         and OnCalendar both appear in a systemd timer, they are OR'd —
+         the timer fires on whichever condition is met first. This caused
+         immediate shutdown when enable was run on an already-booted system.
+         OnCalendar alone with Persistent=false is the correct approach.
+  V2.1 - BUGFIX: cmd_install legacy config migration and install safety
+         gate upversioned to V2.1. No functional change from V2.0 fix —
+         version bump to align script with documentation suite.
+  V2.0 - Version alignment with documentation suite. BUGFIX: cmd_install
+         now migrates legacy configs missing tested/test_epoch fields, and
+         enforces the test gate on install — never re-enables the shutdown
+         timer if tested=False, even if preserved config has enabled=True.
+         Prevents shutdown loop on reinstall over a pre-V2.0 config.
+  V1.9 - Added test-gate safety requirement. `pipower enable` now refuses
+         to activate unless the full halt→wake test cycle has been completed
+         successfully at least once. Mechanism:
+         - `test-alarm --halt` stores test_epoch in config before halting.
+         - On next boot, pipower-alarm.service ExecStart runs `pipower
+           _post-boot`, which checks whether boot time matches test_epoch
+           (within a 5-minute tolerance). On match, sets tested=True and
+           clears test_epoch.
+         - `pipower enable` checks tested=True; refuses with instructions
+           if not set.
+         - `pipower status` shows test status.
+         - `pipower reset-test` clears the tested flag (for re-testing).
+         - alarm_service_content() updated: ExecStart now calls
+           `pipower _post-boot` instead of /bin/true.
+  V1.8 - BUGFIX: Timer firing immediately — removed timezone from
+         OnCalendar, added OnBootSec=2min guard.
+  V1.6 - Added global --verbose (-v) and --debug (-d) flags.
+  V1.5 - Updated chrony NTP sources: NRC stratum-2 servers added.
+  V1.4 - Reverted install location to /usr/local/bin/pipower.
+  V1.1 - (setup guide / architecture only — script unchanged from V1.0)
+  V1.0 - Initial release.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+VERSION      = "V2.3"
+
+# Script install location — /usr/local/bin is correct per FHS for locally-
+# administered tools that depend on system components (Python, systemd).
+INSTALL_BIN  = Path("/usr/local/bin/pipower")
+
+# Configuration directory and file — /etc is correct for host-specific
+# runtime configuration of a locally-installed tool.
+CONFIG_DIR   = Path("/etc/pipower")
+CONFIG_FILE  = CONFIG_DIR / "config.json"
+
+# Linux kernel sysfs interface to the Pi 5 PCF85063A RTC wake alarm.
+# Writing a UTC epoch integer here programs the PMIC to restore power
+# at that time after a halt. Must be cleared (write "0") before writing
+# a new value — the kernel driver requires this two-step sequence.
+WAKEALARM_PATH = Path("/sys/class/rtc/rtc0/wakealarm")
+
+# systemd unit directory — all three pipower units live here.
+SYSTEMD_DIR  = Path("/etc/systemd/system")
+
+# Systemd unit names — defined as constants so any rename is a single change.
+ALARM_SVC_NAME    = "pipower-alarm.service"    # alarm guard — always active
+SHUTDOWN_SVC_NAME = "pipower-shutdown.service" # triggered by timer
+SHUTDOWN_TIMER_NAME = "pipower-shutdown.timer" # fires at sleep_time
+
+# Derived unit file paths.
+ALARM_SVC_PATH    = SYSTEMD_DIR / ALARM_SVC_NAME
+SHUTDOWN_SVC_PATH = SYSTEMD_DIR / SHUTDOWN_SVC_NAME
+SHUTDOWN_TIMER_PATH = SYSTEMD_DIR / SHUTDOWN_TIMER_NAME
+
+# Tolerance in seconds for matching boot time against the expected test
+# wake epoch. Accounts for PMIC startup time, fsck delays, and systemd
+# service ordering jitter. 5 minutes is generous but safe.
+TEST_WAKE_TOLERANCE_SECS = 300
+
+# Default configuration written on first install. The user must run
+# `pipower set`, complete `pipower test-alarm --halt`, and then run
+# `pipower enable` before the schedule becomes active.
+DEFAULT_CONFIG = {
+    "_version":     VERSION,
+    "_description": "pipower configuration - edit with: sudo pipower set --wake HH:MM --sleep HH:MM",
+    "wake_time":    "06:30",           # HH:MM local time to power on
+    "sleep_time":   "22:00",           # HH:MM local time to power off
+    "enabled":      False,             # must be explicitly enabled after review
+    "timezone":     "America/Toronto", # IANA timezone name
+    "tested":       False,             # True after a successful test-alarm --halt cycle
+    "test_epoch":   None,              # epoch stored before test halt; cleared on confirmed wake
+}
+
+
+# ---------------------------------------------------------------------------
+# Logger
+# ---------------------------------------------------------------------------
+
+class Logger:
+    """
+    Module-level output controller for --verbose and --debug modes.
+
+    Two output levels are supported:
+
+      verbose  Step-by-step progress messages showing what the command is
+               doing at a high level (e.g. "Writing systemd unit files").
+               Prefixed with '→'. Activated by --verbose or --debug.
+
+      debug    Low-level implementation detail including variable values,
+               sysfs read/write operations, subprocess command lines, and
+               raw config content. Prefixed with '[DEBUG]'. Activated by
+               --debug only. --debug implies --verbose automatically.
+
+    Both levels write to stdout (not stderr) so output can be captured
+    in pipelines or log files. All output is immediately flushed to ensure
+    correct ordering when interleaved with subprocess output.
+
+    The single module-level instance `LOG` is configured once in main()
+    after argument parsing, then used throughout all helper functions and
+    command implementations without needing to pass it as a parameter.
+    """
+
+    def __init__(self):
+        """Initialise with both output levels disabled."""
+        self.verbose_on = False
+        self.debug_on   = False
+
+    def configure(self, verbose: bool, debug: bool):
+        """
+        Activate output levels based on parsed CLI flags.
+
+        Called once from main() after argparse completes. --debug
+        automatically enables verbose as well, so callers never need
+        to pass both flags.
+
+        Args:
+            verbose: True if --verbose / -v was supplied on the CLI.
+            debug:   True if --debug / -d was supplied on the CLI.
+        """
+        self.verbose_on = verbose or debug   # debug implies verbose
+        self.debug_on   = debug
+
+    def step(self, msg: str):
+        """
+        Emit a verbose-level step message if verbose mode is active.
+
+        Used to narrate high-level command progress: what is about to
+        happen, not implementation details. Output is prefixed with '→'
+        to visually distinguish it from normal command output.
+
+        Args:
+            msg: Human-readable description of the current step.
+        """
+        if self.verbose_on:
+            print(f"  → {msg}", flush=True)
+
+    def debug(self, msg: str):
+        """
+        Emit a debug-level message if debug mode is active.
+
+        Used for low-level implementation detail: variable values,
+        sysfs read/write content, subprocess arguments, config dumps.
+        Output is prefixed with '[DEBUG]'.
+
+        Args:
+            msg: Debug detail string. May be multi-line.
+        """
+        if self.debug_on:
+            print(f"  [DEBUG] {msg}", flush=True)
+
+    def warn(self, msg: str):
+        """
+        Emit a warning message unconditionally (not gated on any flag).
+
+        Used for non-fatal conditions that the user should always see
+        regardless of verbosity level.
+
+        Args:
+            msg: Warning message to display.
+        """
+        print(f"  [WARN]  {msg}", flush=True)
+
+
+LOG = Logger()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def require_root():
+    """
+    Abort with a clear error message if the process is not running as root.
+
+    All commands that modify system state (config, systemd units, sysfs)
+    require root. This check should be the first call in any such command
+    to fail fast before any side effects occur.
+
+    Raises:
+        SystemExit(1): If the effective user ID is not 0 (root).
+    """
+    LOG.debug("Checking for root privileges (euid=0)")
+    if os.geteuid() != 0:
+        print("Error: This command requires root privileges. Use sudo.", file=sys.stderr)
+        sys.exit(1)
+    LOG.debug("Root check passed")
+
+
+def load_config() -> dict:
+    """
+    Read and return the pipower configuration from CONFIG_FILE.
+
+    Parses the JSON config file and returns it as a Python dict. Exits
+    immediately if the file does not exist, since all commands that call
+    this function require a valid installation.
+
+    Returns:
+        dict: Parsed configuration containing wake_time, sleep_time,
+              enabled, and timezone keys.
+
+    Raises:
+        SystemExit(1): If CONFIG_FILE does not exist.
+    """
+    LOG.debug(f"Loading config from {CONFIG_FILE}")
+    if not CONFIG_FILE.exists():
+        print(f"Error: Config not found at {CONFIG_FILE}.", file=sys.stderr)
+        print("Run: sudo pipower install", file=sys.stderr)
+        sys.exit(1)
+    with open(CONFIG_FILE) as f:
+        cfg = json.load(f)
+    LOG.debug(f"Config loaded: {json.dumps(cfg)}")
+    return cfg
+
+
+def save_config(cfg: dict):
+    """
+    Serialise and write the configuration dict to CONFIG_FILE as JSON.
+
+    Creates CONFIG_DIR if it does not already exist. Requires root
+    because CONFIG_DIR lives under /etc. The file is written with
+    2-space indentation for readability.
+
+    Args:
+        cfg: Configuration dict to write. Must contain at minimum the
+             keys: wake_time, sleep_time, enabled, timezone.
+
+    Raises:
+        SystemExit(1): If not running as root (via require_root).
+    """
+    require_root()
+    LOG.step(f"Saving config to {CONFIG_FILE}")
+    LOG.debug(f"Config content: {json.dumps(cfg, indent=2)}")
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, indent=2)
+    LOG.debug("Config saved successfully")
+
+
+def validate_time(t: str) -> bool:
+    """
+    Return True if the string is a valid 24-hour HH:MM time.
+
+    Accepts only exactly two colon-separated integer components where
+    HH is 00–23 and MM is 00–59. Does not accept seconds or AM/PM.
+
+    Args:
+        t: Time string to validate, e.g. "06:30" or "22:00".
+
+    Returns:
+        bool: True if the string is a valid HH:MM time, False otherwise.
+    """
+    LOG.debug(f"Validating time string: '{t}'")
+    try:
+        parts = t.split(":")
+        if len(parts) != 2:
+            return False
+        h, m = int(parts[0]), int(parts[1])
+        result = 0 <= h <= 23 and 0 <= m <= 59
+        LOG.debug(f"Time validation result: {result} (h={h}, m={m})")
+        return result
+    except (ValueError, IndexError):
+        LOG.debug(f"Time validation failed: could not parse '{t}'")
+        return False
+
+
+def next_wake_epoch(wake_time_str: str, tz_name: str) -> int:
+    """
+    Compute the UTC epoch for the next occurrence of a local wall-clock time.
+
+    This function is DST-correct. By using ZoneInfo for both the current
+    time and the candidate datetime, Python's datetime library performs
+    the UTC conversion using the UTC offset that applies at the candidate
+    time — not the current offset. This means a wake time of 06:30 will
+    map to the correct UTC epoch even across a DST transition overnight.
+
+    Algorithm:
+        1. Get the current local time in tz_name.
+        2. Build a candidate datetime for today at wake_time_str in tz_name.
+        3. If the candidate is in the past (or exactly now), add one day.
+        4. Convert to a UTC epoch integer via timestamp().
+
+    Args:
+        wake_time_str: Target local wall-clock time as "HH:MM" (24h).
+        tz_name:       IANA timezone name, e.g. "America/Toronto".
+
+    Returns:
+        int: UTC epoch seconds for the next occurrence of wake_time_str
+             in the given timezone. Always in the future.
+    """
+    LOG.debug(f"Computing next wake epoch for {wake_time_str} in {tz_name}")
+    tz = ZoneInfo(tz_name)
+    now = datetime.now(tz)
+    h, m = map(int, wake_time_str.split(":"))
+    # Build today's candidate — replace preserves the timezone context
+    candidate = now.replace(hour=h, minute=m, second=0, microsecond=0)
+    LOG.debug(f"Now:       {now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    LOG.debug(f"Candidate: {candidate.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    if candidate <= now:
+        # Wake time has already passed today — target tomorrow instead
+        candidate += timedelta(days=1)
+        LOG.debug(f"Candidate in past — advanced to tomorrow: "
+                  f"{candidate.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    epoch = int(candidate.timestamp())
+    LOG.debug(f"Wake epoch: {epoch} "
+              f"({candidate.strftime('%Y-%m-%d %H:%M:%S %Z')})")
+    return epoch
+
+
+def set_wakealarm(epoch: int):
+    """
+    Write a UTC epoch to the kernel RTC wake alarm sysfs interface.
+
+    The Linux kernel RTC driver requires a two-step write: first clear
+    the existing alarm by writing "0", then write the new epoch value.
+    Writing the epoch directly without clearing first may be silently
+    ignored on some kernel versions.
+
+    When the system halts, the PMIC monitors this register and restores
+    power when the epoch is reached. External 5V must remain present.
+
+    Args:
+        epoch: UTC epoch integer representing the desired wake time.
+               Must be a future timestamp; past epochs have no effect.
+
+    Raises:
+        FileNotFoundError: If WAKEALARM_PATH does not exist, indicating
+                           the RTC driver has not initialised correctly.
+    """
+    LOG.step(f"Writing RTC wake alarm to {WAKEALARM_PATH}")
+    LOG.debug(f"Alarm epoch: {epoch}")
+    if not WAKEALARM_PATH.exists():
+        raise FileNotFoundError(
+            f"{WAKEALARM_PATH} not found. Is the Pi 5 RTC initialized? "
+            "Check: dmesg | grep -i rtc"
+        )
+    # Step 1: clear any existing alarm value
+    LOG.debug(f"Writing 0 to {WAKEALARM_PATH} (clear previous alarm)")
+    WAKEALARM_PATH.write_text("0\n")
+    # Step 2: write the new epoch
+    LOG.debug(f"Writing epoch {epoch} to {WAKEALARM_PATH}")
+    WAKEALARM_PATH.write_text(f"{epoch}\n")
+    LOG.debug("Wake alarm write complete")
+
+
+def read_wakealarm() -> int | None:
+    """
+    Read the currently programmed RTC wake alarm epoch from sysfs.
+
+    The sysfs file contains the epoch as a decimal string, or is empty
+    if no alarm is set (e.g. immediately after boot, before the first
+    scheduled shutdown).
+
+    Returns:
+        int:  The currently programmed wake alarm as a UTC epoch, or
+        None: If the file is empty, unreadable, or does not exist.
+    """
+    LOG.debug(f"Reading {WAKEALARM_PATH}")
+    try:
+        val = WAKEALARM_PATH.read_text().strip()
+        result = int(val) if val else None
+        LOG.debug(f"Read wakealarm value: '{val}' → {result}")
+        return result
+    except (FileNotFoundError, ValueError) as e:
+        LOG.debug(f"Could not read wakealarm: {e}")
+        return None
+
+
+def check_eeprom_power_off() -> bool | None:
+    """
+    Check whether the Pi 5 bootloader EEPROM has POWER_OFF_ON_HALT=1.
+
+    When POWER_OFF_ON_HALT=1, `sudo halt` places the PMIC in full
+    STANDBY mode (~3mA draw), which is required for the RTC wake alarm
+    to function correctly. Without it, halt leaves 3V3/5V rails partially
+    active, increasing power draw and potentially interfering with wake.
+
+    Uses `rpi-eeprom-config` to read the current bootloader config and
+    scans the output for the POWER_OFF_ON_HALT key.
+
+    Returns:
+        True:  POWER_OFF_ON_HALT is present and set to 1.
+        False: POWER_OFF_ON_HALT is absent or set to a value other than 1.
+        None:  rpi-eeprom-config was not found or timed out — check
+               skipped gracefully without blocking install.
+    """
+    LOG.step("Checking bootloader EEPROM for POWER_OFF_ON_HALT")
+    LOG.debug("Running: rpi-eeprom-config")
+    try:
+        result = subprocess.run(
+            ["rpi-eeprom-config"],
+            capture_output=True, text=True, timeout=10
+        )
+        LOG.debug(f"rpi-eeprom-config stdout:\n{result.stdout.strip()}")
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("POWER_OFF_ON_HALT"):
+                _, _, val = line.partition("=")
+                found = val.strip() == "1"
+                LOG.debug(f"POWER_OFF_ON_HALT = '{val.strip()}' → {found}")
+                return found
+        LOG.debug("POWER_OFF_ON_HALT not found in EEPROM config")
+        return False
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        LOG.debug(f"EEPROM check failed: {e}")
+        return None
+
+
+def systemctl(*args, check: bool = True, capture: bool = False):
+    """
+    Run a systemctl subcommand, optionally capturing its output.
+
+    A thin wrapper around subprocess.run() that adds debug logging of
+    the command being run and its output, and handles the two most common
+    calling patterns: fire-and-forget (check=True) and query (capture=True).
+
+    Args:
+        *args:   systemctl subcommand and arguments, e.g.
+                 ("enable", "--now", "pipower-alarm.service").
+        check:   If True (default), raise CalledProcessError on non-zero
+                 exit. Pass check=False for commands where failure is
+                 acceptable (e.g. disabling a unit that may not exist).
+        capture: If True, capture stdout and stderr as text strings and
+                 return them in the CompletedProcess result. Required for
+                 commands whose output is read programmatically (status,
+                 show). If False (default), output goes to the terminal.
+
+    Returns:
+        subprocess.CompletedProcess: Result object. When capture=True,
+        result.stdout and result.stderr contain the command output.
+    """
+    cmd = ["systemctl"] + list(args)
+    LOG.debug(f"Running: {' '.join(cmd)}")
+    result = subprocess.run(
+        cmd,
+        check=check,
+        capture_output=capture,
+        text=capture       # text=True only when capturing; avoids encoding issues
+    )
+    if capture and LOG.debug_on:
+        if result.stdout.strip():
+            LOG.debug(f"stdout: {result.stdout.strip()}")
+        if result.stderr.strip():
+            LOG.debug(f"stderr: {result.stderr.strip()}")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Systemd unit generators
+# ---------------------------------------------------------------------------
+#
+# These functions return the text content of the three systemd units that
+# pipower installs. Generating content at runtime (rather than bundling
+# static files) means the unit content always reflects the current
+# INSTALL_BIN path and config values without a separate template step.
+# ---------------------------------------------------------------------------
+
+def alarm_service_content() -> str:
+    """
+    Generate the content for pipower-alarm.service.
+
+    This is the central safety net of the pipower architecture. The service
+    uses Type=oneshot with RemainAfterExit=yes so it stays in 'active' state
+    from boot until shutdown. systemd runs ExecStop when the unit transitions
+    from active to inactive — i.e. during any system shutdown, regardless of
+    cause (scheduled, manual halt, or emergency poweroff).
+
+    ExecStart runs `pipower _post-boot` on every boot. This checks whether
+    the system woke from a test alarm (by comparing boot time against the
+    stored test_epoch in config), and if so marks the installation as tested.
+    This is the mechanism that gates `pipower enable` on a successful
+    halt→wake cycle having been completed.
+
+    ExecStop runs `pipower _pre-shutdown` during every shutdown, writing
+    the next wake epoch to the RTC wakealarm sysfs file before halt.
+
+    Key unit directives:
+        DefaultDependencies=no  — prevents circular dependency with shutdown
+                                  targets; the unit must outlive them.
+        Before=shutdown.target  — guarantees ExecStop runs before the system
+                                  halts, not concurrently with it.
+        RemainAfterExit=yes     — keeps the unit in 'active' state after
+                                  ExecStart completes so ExecStop fires.
+
+    Returns:
+        str: Complete systemd unit file content ready to write to disk.
+    """
+    return f"""\
+[Unit]
+Description=pipower - RTC wake alarm manager (sets alarm before any shutdown)
+DefaultDependencies=no
+After=multi-user.target network-online.target
+Before=shutdown.target poweroff.target halt.target reboot.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart={INSTALL_BIN} _post-boot
+ExecStop={INSTALL_BIN} _pre-shutdown
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def shutdown_timer_content(sleep_time: str, timezone: str) -> str:
+    """
+    Generate the content for pipower-shutdown.timer.
+
+    Uses systemd's OnCalendar syntax WITHOUT an embedded timezone string.
+    systemd uses the system's local timezone by default for OnCalendar
+    expressions, which is already correctly set via timedatectl. Embedding
+    a timezone string in OnCalendar caused immediate or incorrect timer
+    firing on some systemd versions and is therefore not used.
+
+    OnBootSec is intentionally NOT used. When both OnCalendar and OnBootSec
+    are present in the same timer unit, systemd fires on whichever condition
+    is met first (OR logic). This means OnBootSec causes the timer to fire
+    immediately if the system has been up longer than that interval when the
+    timer is enabled — exactly the shutdown loop failure mode seen in testing.
+
+    Persistent=false prevents the timer from catching up if the system was
+    powered off when it was scheduled to fire — avoids an unintended shutdown
+    on the next boot after a power outage or manual shutdown.
+
+    Args:
+        sleep_time: Shutdown time as "HH:MM" (24h), e.g. "22:00".
+        timezone:   IANA timezone name. Not embedded in OnCalendar —
+                    retained as a parameter for documentation/display only.
+                    The system timezone (timedatectl) must match this value.
+
+    Returns:
+        str: Complete systemd timer unit file content ready to write to disk.
+    """
+    return f"""\
+[Unit]
+Description=pipower - Scheduled shutdown timer ({sleep_time} {timezone})
+
+[Timer]
+OnCalendar=*-*-* {sleep_time}:00
+Persistent=false
+
+[Install]
+WantedBy=timers.target
+"""
+
+
+def shutdown_service_content() -> str:
+    """
+    Generate the content for pipower-shutdown.service.
+
+    A minimal one-shot service triggered by the timer. Its only job is
+    to call `systemctl poweroff`, which initiates the normal systemd
+    shutdown sequence — which in turn triggers pipower-alarm.service's
+    ExecStop to set the RTC wake alarm before halt completes.
+
+    DefaultDependencies=no prevents ordering conflicts with the shutdown
+    targets that this service is itself initiating.
+
+    Returns:
+        str: Complete systemd service unit file content ready to write to disk.
+    """
+    return f"""\
+[Unit]
+Description=pipower - Execute scheduled poweroff
+DefaultDependencies=no
+After=pipower-alarm.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl poweroff
+"""
+
+
+def write_systemd_units(cfg: dict):
+    """
+    Write all three systemd unit files to disk and reload the daemon.
+
+    Generates unit content from the current config and INSTALL_BIN path,
+    writes each file atomically via Path.write_text(), then calls
+    `systemctl daemon-reload` so systemd picks up the new/changed units.
+
+    This function is called by cmd_install (initial setup), cmd_set
+    (when sleep_time or timezone changes), and cmd_enable (if units are
+    missing). The timer unit embeds sleep_time and timezone so it must
+    be regenerated whenever those values change.
+
+    Args:
+        cfg: Current configuration dict. Must contain 'sleep_time' and
+             'timezone' keys used in the timer unit's OnCalendar directive.
+    """
+    LOG.step(f"Writing {ALARM_SVC_PATH}")
+    LOG.debug(f"Content:\n{alarm_service_content()}")
+    ALARM_SVC_PATH.write_text(alarm_service_content())
+
+    LOG.step(f"Writing {SHUTDOWN_SVC_PATH}")
+    LOG.debug(f"Content:\n{shutdown_service_content()}")
+    SHUTDOWN_SVC_PATH.write_text(shutdown_service_content())
+
+    LOG.step(f"Writing {SHUTDOWN_TIMER_PATH}")
+    timer_content = shutdown_timer_content(cfg["sleep_time"], cfg["timezone"])
+    LOG.debug(f"Content:\n{timer_content}")
+    SHUTDOWN_TIMER_PATH.write_text(timer_content)
+
+    LOG.step("Reloading systemd daemon")
+    systemctl("daemon-reload")
+
+
+# ---------------------------------------------------------------------------
+# Command implementations
+#
+# Each cmd_* function corresponds to one CLI subcommand. All receive the
+# argparse Namespace object as their sole argument, which carries both the
+# subcommand-specific options and the global --verbose / --debug flags
+# (already consumed by main() to configure LOG before dispatch).
+#
+# Commands that modify system state always call require_root() first.
+# ---------------------------------------------------------------------------
+
+def cmd_install(args):
+    """
+    Install pipower: run prerequisite checks, create config, and install
+    and enable the three systemd units.
+
+    Performs the following steps in order:
+      1. Check the script is present at INSTALL_BIN.
+      2. Check the RTC wakealarm sysfs interface exists.
+      3. Check EEPROM POWER_OFF_ON_HALT setting.
+      4. Create /etc/pipower/config.json with defaults (or preserve existing).
+      5. Write all three systemd unit files.
+      6. Enable and start pipower-alarm.service (always active).
+      7. Migrate legacy config fields (tested, test_epoch) if absent —
+         prevents None being treated as falsy in an unexpected way.
+      8. SAFETY GATE: Never re-enable the shutdown timer unless tested=True.
+         If a preserved config has enabled=True but tested=False (e.g. from
+         a pre-V2.0 install), resets enabled=False and refuses to start the
+         timer. Forces the test cycle to be completed before re-enabling.
+
+    Args:
+        args: argparse.Namespace — no subcommand-specific arguments.
+
+    Raises:
+        SystemExit(1): If not running as root.
+    """
+    LOG.step("Starting install")
+    require_root()
+
+    # Check script is in the expected location
+    LOG.step(f"Checking script exists at {INSTALL_BIN}")
+    if not INSTALL_BIN.exists():
+        print(
+            f"Warning: Script not found at {INSTALL_BIN}.\n"
+            "  Copy it there first:\n"
+            f"  sudo cp pipower {INSTALL_BIN}\n"
+            f"  sudo chmod +x {INSTALL_BIN}\n"
+        )
+    else:
+        LOG.debug(f"Script found at {INSTALL_BIN}")
+
+    # Check RTC wakealarm interface — absence means the RTC driver hasn't loaded
+    print("\n--- Prerequisite checks ---")
+    LOG.step(f"Checking RTC wakealarm interface: {WAKEALARM_PATH}")
+    if WAKEALARM_PATH.exists():
+        print(f"  [OK] RTC wake alarm interface: {WAKEALARM_PATH}")
+    else:
+        print(f"  [!!] {WAKEALARM_PATH} NOT FOUND.")
+        print("       Run: dmesg | grep -i rtc  to diagnose RTC state.")
+
+    # Check EEPROM for POWER_OFF_ON_HALT — not fatal if absent, just advisory
+    eeprom = check_eeprom_power_off()
+    if eeprom is True:
+        print("  [OK] EEPROM: POWER_OFF_ON_HALT=1 (deep PMIC standby on halt)")
+    elif eeprom is False:
+        print("  [!!] EEPROM: POWER_OFF_ON_HALT is NOT set to 1.")
+        print("       Wake-from-alarm still works but halt power draw is higher.")
+        print("       To fix (requires reboot to apply):")
+        print("         sudo raspi-config → Advanced Options → Bootloader Version")
+        print("         → set 'Full power off' / POWER_OFF_ON_HALT=1")
+        print("       Or manually: sudo -E rpi-eeprom-config --edit")
+        print("                    Add: POWER_OFF_ON_HALT=1")
+    else:
+        print("  [--] EEPROM check skipped (rpi-eeprom-config not available)")
+
+    print()
+
+    # Config — preserve existing values if already installed
+    LOG.step(f"Checking for existing config at {CONFIG_FILE}")
+    if CONFIG_FILE.exists():
+        cfg = load_config()
+        print(f"Existing config found at {CONFIG_FILE} — preserving values.")
+        LOG.debug(f"Preserved config: {json.dumps(cfg)}")
+    else:
+        LOG.step("Creating default config")
+        cfg = DEFAULT_CONFIG.copy()
+        save_config(cfg)
+        print(f"Default config created at {CONFIG_FILE}")
+        print("  Customize: sudo pipower set --wake 06:30 --sleep 22:00 --timezone America/Toronto")
+
+    # Write units — always regenerated so they reflect current INSTALL_BIN
+    LOG.step("Writing systemd unit files")
+    write_systemd_units(cfg)
+    print(f"Installed: {ALARM_SVC_PATH}")
+    print(f"Installed: {SHUTDOWN_SVC_PATH}")
+    print(f"Installed: {SHUTDOWN_TIMER_PATH}")
+
+    # Always enable the alarm guard — it must survive reboots to protect every shutdown
+    LOG.step(f"Enabling and starting {ALARM_SVC_NAME}")
+    systemctl("enable", "--now", ALARM_SVC_NAME)
+    print(f"Enabled:   {ALARM_SVC_NAME} (sets RTC alarm before every shutdown)")
+
+    # Migrate legacy configs that predate the tested/test_epoch fields
+    # so cfg.get("tested") returns False rather than None for old installs
+    migrated = False
+    if "tested" not in cfg:
+        cfg["tested"]     = False
+        cfg["test_epoch"] = None
+        migrated = True
+        LOG.debug("Migrated legacy config: added tested=False, test_epoch=None")
+    if "test_epoch" not in cfg:
+        cfg["test_epoch"] = None
+        migrated = True
+        LOG.debug("Migrated legacy config: added test_epoch=None")
+    if migrated:
+        save_config(cfg)
+        print(f"Config migrated to V2.0 schema (tested/test_epoch fields added).")
+
+    # Safety gate: NEVER re-enable the shutdown timer on install unless the
+    # test cycle has been completed. A preserved config with enabled=True but
+    # tested=False means the test was never run — refuse to enable and force
+    # the user to complete the test first. This prevents the shutdown loop.
+    if cfg.get("enabled") and not cfg.get("tested"):
+        # Reset enabled to False — must pass the test gate before re-enabling
+        cfg["enabled"] = False
+        save_config(cfg)
+        print(f"\n[SAFETY] Preserved config had enabled=True but tested=False.")
+        print(f"         Shutdown timer NOT started — test cycle required first.")
+        print(f"         Run: sudo pipower test-alarm --minutes 5 --halt")
+        print(f"         Then: sudo pipower enable")
+    elif cfg.get("enabled") and cfg.get("tested"):
+        LOG.step(f"Enabling and starting {SHUTDOWN_TIMER_NAME}")
+        systemctl("enable", "--now", SHUTDOWN_TIMER_NAME)
+        print(f"Enabled:   {SHUTDOWN_TIMER_NAME}")
+    else:
+        print(f"\nScheduled shutdown timer is NOT yet enabled.")
+        print("  Complete test cycle first: sudo pipower test-alarm --minutes 5 --halt")
+        print("  Then run: sudo pipower enable")
+
+    print(f"\npipower {VERSION} installed successfully.\n")
+
+
+def cmd_uninstall(args):
+    """
+    Remove all three systemd units and reload the daemon.
+
+    Disables and stops each unit before removing the file. The config
+    file and the script itself are intentionally preserved so that
+    re-running `pipower install` restores the previous configuration.
+
+    Removal order is reverse-dependency order: timer first, then the
+    service it triggers, then the alarm guard last.
+
+    Args:
+        args: argparse.Namespace — no subcommand-specific arguments.
+
+    Raises:
+        SystemExit(1): If not running as root.
+    """
+    LOG.step("Starting uninstall")
+    require_root()
+
+    # Disable and stop in reverse-dependency order; check=False because
+    # a unit may not exist if install was partial
+    for unit in [SHUTDOWN_TIMER_NAME, SHUTDOWN_SVC_NAME, ALARM_SVC_NAME]:
+        LOG.step(f"Disabling and stopping {unit}")
+        systemctl("disable", "--now", unit, check=False)
+
+    for path in [ALARM_SVC_PATH, SHUTDOWN_SVC_PATH, SHUTDOWN_TIMER_PATH]:
+        LOG.debug(f"Checking for {path}")
+        if path.exists():
+            LOG.step(f"Removing {path}")
+            path.unlink()
+            print(f"Removed: {path}")
+        else:
+            LOG.debug(f"{path} not found — skipping")
+
+    LOG.step("Reloading systemd daemon")
+    systemctl("daemon-reload")
+    print(f"\nSystemd units removed. Config preserved at {CONFIG_FILE}")
+    print(f"Script preserved at {INSTALL_BIN}")
+    print(f"To fully remove:\n"
+          f"  sudo rm {INSTALL_BIN}\n"
+          f"  sudo rm -rf /etc/pipower")
+
+
+def cmd_set(args):
+    """
+    Update one or more configuration values and persist them to disk.
+
+    Validates each supplied value before writing. If any value is invalid
+    the command exits without modifying the config. After a successful
+    write, regenerates the systemd timer unit (if installed) because the
+    OnCalendar expression embeds sleep_time and timezone directly.
+
+    Args:
+        args: argparse.Namespace with optional attributes:
+            wake     (str): New wake time as "HH:MM" (24h). Optional.
+            sleep    (str): New sleep time as "HH:MM" (24h). Optional.
+            timezone (str): New IANA timezone name. Optional.
+
+    Raises:
+        SystemExit(1): If not running as root, or if any value is invalid.
+    """
+    LOG.step("Starting set")
+    require_root()
+    cfg = load_config()
+    changed = False  # track whether anything actually changed
+
+    if args.wake:
+        LOG.step(f"Validating wake time: {args.wake}")
+        if not validate_time(args.wake):
+            print(f"Error: Invalid time '{args.wake}'. Use HH:MM (24h).", file=sys.stderr)
+            sys.exit(1)
+        LOG.debug(f"Updating wake_time: {cfg['wake_time']} → {args.wake}")
+        cfg["wake_time"] = args.wake
+        changed = True
+
+    if args.sleep:
+        LOG.step(f"Validating sleep time: {args.sleep}")
+        if not validate_time(args.sleep):
+            print(f"Error: Invalid time '{args.sleep}'. Use HH:MM (24h).", file=sys.stderr)
+            sys.exit(1)
+        LOG.debug(f"Updating sleep_time: {cfg['sleep_time']} → {args.sleep}")
+        cfg["sleep_time"] = args.sleep
+        changed = True
+
+    if args.timezone:
+        LOG.step(f"Validating timezone: {args.timezone}")
+        try:
+            # ZoneInfo raises ZoneInfoNotFoundError for unknown timezone names
+            ZoneInfo(args.timezone)
+        except ZoneInfoNotFoundError:
+            print(f"Error: Unknown timezone '{args.timezone}'.", file=sys.stderr)
+            print("Browse zones: timedatectl list-timezones | grep America", file=sys.stderr)
+            sys.exit(1)
+        LOG.debug(f"Updating timezone: {cfg['timezone']} → {args.timezone}")
+        cfg["timezone"] = args.timezone
+        changed = True
+
+    if not changed:
+        print("No changes specified. Use --wake, --sleep, and/or --timezone.")
+        return
+
+    save_config(cfg)
+    print(f"Config updated:")
+    print(f"  Wake:     {cfg['wake_time']} {cfg['timezone']}")
+    print(f"  Sleep:    {cfg['sleep_time']} {cfg['timezone']}")
+    print(f"  Enabled:  {cfg.get('enabled', False)}")
+
+    # Regenerate and reload timer only if already installed — avoids
+    # writing unit files before install has been run
+    if SHUTDOWN_TIMER_PATH.exists():
+        LOG.step("Regenerating systemd units with updated config")
+        write_systemd_units(cfg)
+        if cfg.get("enabled"):
+            # Restart to pick up the new OnCalendar expression immediately
+            LOG.step(f"Restarting {SHUTDOWN_TIMER_NAME}")
+            systemctl("restart", SHUTDOWN_TIMER_NAME)
+            print(f"Timer restarted with new schedule.")
+        print(f"Systemd units updated.")
+
+
+def cmd_enable(args):
+    """
+    Enable the scheduled wake/sleep cycle and start the shutdown timer.
+
+    Requires that the full halt→wake test cycle has been completed
+    successfully at least once (tested=True in config). This gate
+    prevents enabling the production schedule before the wake mechanism
+    has been verified, avoiding the shutdown-loop failure mode.
+
+    If the test has not been completed, prints clear instructions and
+    exits without making any changes.
+
+    Args:
+        args: argparse.Namespace — no subcommand-specific arguments.
+
+    Raises:
+        SystemExit(1): If not running as root, or if test not completed.
+    """
+    LOG.step("Enabling scheduled shutdown cycle")
+    require_root()
+    cfg = load_config()
+
+    # Gate: refuse to enable unless the test cycle has been completed
+    if not cfg.get("tested"):
+        print("Error: pipower has not been tested yet.", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("You must complete a full halt→wake test cycle before enabling.", file=sys.stderr)
+        print("This confirms the RTC wake alarm works on your hardware.", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("Run the test (Pi will halt and wake automatically):", file=sys.stderr)
+        print(f"  sudo pipower test-alarm --minutes 5 --halt", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("After the Pi wakes, check tested status:", file=sys.stderr)
+        print("  sudo pipower status", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("Then run enable again:", file=sys.stderr)
+        print("  sudo pipower enable", file=sys.stderr)
+        sys.exit(1)
+
+    LOG.debug("Setting enabled=True in config")
+    cfg["enabled"] = True
+    save_config(cfg)
+
+    # Write units if this is the first enable after a fresh install
+    if not SHUTDOWN_TIMER_PATH.exists():
+        LOG.step("Timer unit not found — writing systemd units first")
+        write_systemd_units(cfg)
+
+    LOG.step(f"Enabling and starting {SHUTDOWN_TIMER_NAME}")
+    systemctl("enable", "--now", SHUTDOWN_TIMER_NAME)
+    print(f"Scheduled shutdown enabled.")
+    print(f"  Shutdown at: {cfg['sleep_time']} {cfg['timezone']}")
+    print(f"  Wake at:     {cfg['wake_time']} {cfg['timezone']}")
+
+
+def cmd_disable(args):
+    """
+    Disable the scheduled shutdown timer without removing it.
+
+    Sets enabled=False in config and stops/disables the shutdown timer
+    so it will not fire again. The alarm guard service (pipower-alarm.service)
+    remains active and will still set the RTC wake alarm on any manual
+    shutdown. This allows manual use of `pipower shutdown` while the
+    automatic schedule is paused.
+
+    Args:
+        args: argparse.Namespace — no subcommand-specific arguments.
+
+    Raises:
+        SystemExit(1): If not running as root.
+    """
+    LOG.step("Disabling scheduled shutdown cycle")
+    require_root()
+    cfg = load_config()
+    LOG.debug("Setting enabled=False in config")
+    cfg["enabled"] = False
+    save_config(cfg)
+
+    if SHUTDOWN_TIMER_PATH.exists():
+        LOG.step(f"Disabling and stopping {SHUTDOWN_TIMER_NAME}")
+        systemctl("disable", "--now", SHUTDOWN_TIMER_NAME)
+    else:
+        LOG.debug(f"{SHUTDOWN_TIMER_NAME} not found — already inactive")
+
+    print("Scheduled shutdown disabled.")
+    print("The alarm service remains active and will still set an RTC alarm")
+    print("on any manual shutdown (clearing it requires: sudo pipower uninstall).")
+
+
+def cmd_status(args):
+    """
+    Display a formatted status summary of the pipower installation.
+
+    Queries the current config, systemd unit states, next timer elapse,
+    RTC wake alarm value, and EEPROM setting, then prints them in a
+    single consolidated view. Does not require root — all queries are
+    read-only.
+
+    Output includes:
+      - Configuration values (wake/sleep times, timezone, enabled state)
+      - Current local time in the configured timezone
+      - pipower-alarm.service active state
+      - pipower-shutdown.timer active state and next scheduled fire time
+      - Current RTC wake alarm (epoch + human-readable local and UTC)
+      - EEPROM POWER_OFF_ON_HALT state
+
+    Args:
+        args: argparse.Namespace — no subcommand-specific arguments.
+    """
+    LOG.step("Collecting status information")
+    if not CONFIG_FILE.exists():
+        print("pipower is not installed. Run: sudo pipower install")
+        return
+
+    cfg = load_config()
+
+    LOG.step(f"Resolving timezone: {cfg['timezone']}")
+    try:
+        tz = ZoneInfo(cfg["timezone"])
+    except ZoneInfoNotFoundError:
+        print(f"Warning: Invalid timezone in config: {cfg['timezone']}")
+        tz = ZoneInfo("UTC")
+
+    now = datetime.now(tz)
+    LOG.debug(f"Current time: {now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+
+    print(f"\n{'─'*52}")
+    print(f"  pipower {VERSION} — Status")
+    print(f"{'─'*52}")
+    print(f"  Config:       {CONFIG_FILE}")
+    print(f"  Wake time:    {cfg['wake_time']} {cfg['timezone']}")
+    print(f"  Sleep time:   {cfg['sleep_time']} {cfg['timezone']}")
+    print(f"  Enabled:      {'Yes' if cfg.get('enabled') else 'No'}")
+    # Test gate status — show clearly so user knows what is required
+    tested = cfg.get("tested", False)
+    test_epoch = cfg.get("test_epoch")
+    if tested:
+        print(f"  Tested:       Yes ✓")
+    elif test_epoch:
+        # Test alarm was set and Pi halted — waiting for wake confirmation
+        tz_local = ZoneInfo(cfg["timezone"])
+        test_dt  = datetime.fromtimestamp(test_epoch, tz=tz_local)
+        print(f"  Tested:       Pending — waiting for wake from "
+              f"{test_dt.strftime('%H:%M:%S %Z')} "
+              f"(epoch {test_epoch})")
+    else:
+        print(f"  Tested:       No — run: sudo pipower test-alarm --minutes 5 --halt")
+    print(f"  Current time: {now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    print()
+
+    # Query alarm service state
+    LOG.step(f"Querying systemd: {ALARM_SVC_NAME}")
+    r = systemctl("is-active", ALARM_SVC_NAME, check=False, capture=True)
+    alarm_svc_state = r.stdout.strip()
+    print(f"  Alarm service ({ALARM_SVC_NAME}): {alarm_svc_state}")
+
+    # Query shutdown timer state
+    LOG.step(f"Querying systemd: {SHUTDOWN_TIMER_NAME}")
+    r = systemctl("is-active", SHUTDOWN_TIMER_NAME, check=False, capture=True)
+    timer_state = r.stdout.strip()
+    print(f"  Shutdown timer ({SHUTDOWN_TIMER_NAME}): {timer_state}")
+
+    # If timer is active, extract and display the next elapse time.
+    # NextElapseUSecRealtime is a monotonic microsecond timestamp from
+    # systemd's clock; divide by 1,000,000 to get a POSIX epoch.
+    if timer_state == "active":
+        r = systemctl(
+            "show", SHUTDOWN_TIMER_NAME,
+            "--property=NextElapseUSecRealtime",
+            check=False, capture=True
+        )
+        for line in r.stdout.splitlines():
+            if "NextElapseUSecRealtime" in line:
+                try:
+                    usec = int(line.split("=")[1])
+                    if usec > 0:
+                        next_dt = datetime.fromtimestamp(usec / 1_000_000, tz=tz)
+                        print(f"  Next shutdown:  {next_dt.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+                except (ValueError, IndexError):
+                    pass
+
+    # Read and display the current RTC wake alarm
+    print()
+    LOG.step("Reading RTC wake alarm")
+    alarm_epoch = read_wakealarm()
+    if alarm_epoch and alarm_epoch > 0:
+        alarm_local = datetime.fromtimestamp(alarm_epoch, tz=tz)
+        alarm_utc   = datetime.fromtimestamp(alarm_epoch, tz=ZoneInfo("UTC"))
+        print(f"  RTC alarm:    {alarm_local.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+        print(f"                ({alarm_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}, epoch {alarm_epoch})")
+    else:
+        print(f"  RTC alarm:    not set (set at next shutdown)")
+
+    # EEPROM check — informational, not blocking
+    LOG.step("Checking EEPROM POWER_OFF_ON_HALT")
+    eeprom = check_eeprom_power_off()
+    if eeprom is True:
+        print(f"  EEPROM:       POWER_OFF_ON_HALT=1 [OK]")
+    elif eeprom is False:
+        print(f"  EEPROM:       POWER_OFF_ON_HALT not set [WARNING - see install output]")
+    else:
+        print(f"  EEPROM:       check unavailable")
+
+    print(f"{'─'*52}\n")
+
+
+def cmd_shutdown(args):
+    """
+    Set the RTC wake alarm for the next wake_time, then initiate poweroff.
+
+    Preferred over running `sudo shutdown -h now` directly because it
+    explicitly sets and confirms the wake alarm before halting, and
+    provides a 3-second cancellation window. The underlying alarm guard
+    service (pipower-alarm.service ExecStop) will also fire during the
+    subsequent poweroff sequence and set the alarm a second time — this
+    is harmless as the same epoch value is written.
+
+    If pipower is disabled, warns the user and prompts for confirmation
+    (bypassed with --force).
+
+    Args:
+        args: argparse.Namespace with attribute:
+            force (bool): If True, skip the confirmation prompt when
+                          pipower is disabled and proceed with shutdown.
+
+    Raises:
+        SystemExit(1): If not running as root.
+        SystemExit(0): If the user cancels at the countdown prompt.
+    """
+    LOG.step("Starting shutdown sequence")
+    require_root()
+    cfg = load_config()
+
+    if not cfg.get("enabled"):
+        print("Warning: pipower is disabled. Alarm will NOT be set.")
+        LOG.debug("pipower disabled — skipping wake alarm")
+        if not args.force:
+            answer = input("Proceed with shutdown anyway? [y/N]: ").strip().lower()
+            if answer != "y":
+                print("Shutdown cancelled.")
+                sys.exit(0)
+    else:
+        LOG.step(f"Computing next wake epoch for {cfg['wake_time']} {cfg['timezone']}")
+        epoch    = next_wake_epoch(cfg["wake_time"], cfg["timezone"])
+        tz       = ZoneInfo(cfg["timezone"])
+        local_dt = datetime.fromtimestamp(epoch, tz=tz)
+        LOG.debug(f"Wake epoch: {epoch} ({local_dt.strftime('%Y-%m-%d %H:%M:%S %Z')})")
+        try:
+            set_wakealarm(epoch)
+            print(f"RTC wake alarm set for {local_dt.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+        except Exception as e:
+            print(f"Warning: Could not set wake alarm: {e}", file=sys.stderr)
+
+    # 3-second countdown allows Ctrl+C cancellation before poweroff
+    print("Initiating poweroff in 3 seconds... (Ctrl+C to cancel)")
+    try:
+        time.sleep(3)
+    except KeyboardInterrupt:
+        print("\nShutdown cancelled.")
+        sys.exit(0)
+
+    LOG.step("Calling systemctl poweroff")
+    subprocess.run(["systemctl", "poweroff"])
+
+
+def cmd_pre_shutdown(args):
+    """
+    Internal handler called by pipower-alarm.service ExecStop.
+
+    This function is NOT intended for direct user invocation. It is called
+    automatically by systemd as part of every system shutdown sequence,
+    via the ExecStop directive in pipower-alarm.service.
+
+    Reads the config, computes the next wake epoch, and writes it to the
+    RTC wakealarm sysfs file. Always exits with code 0 — even on error —
+    to avoid blocking or delaying the shutdown process. Errors are logged
+    to stderr so they appear in the systemd journal.
+
+    The function is intentionally conservative: if the config is missing
+    or pipower is disabled, it exits cleanly without setting an alarm
+    rather than aborting shutdown.
+
+    Args:
+        args: argparse.Namespace — no subcommand-specific arguments.
+
+    Exits:
+        0: Always. Any error condition exits 0 to not block shutdown.
+    """
+    LOG.step("_pre-shutdown triggered by systemd ExecStop")
+    require_root()
+
+    try:
+        cfg = load_config()
+    except SystemExit:
+        # Config missing — log and exit cleanly so shutdown is not blocked
+        print("pipower: config not found, skipping wake alarm.", file=sys.stderr)
+        sys.exit(0)
+
+    LOG.debug(f"enabled={cfg.get('enabled')}")
+    if not cfg.get("enabled"):
+        # Pipower is disabled — don't set an alarm, exit cleanly
+        print("pipower: disabled — wake alarm not set.")
+        sys.exit(0)
+
+    try:
+        LOG.step(f"Computing next wake time for {cfg['wake_time']} {cfg['timezone']}")
+        epoch    = next_wake_epoch(cfg["wake_time"], cfg["timezone"])
+        tz       = ZoneInfo(cfg["timezone"])
+        local_dt = datetime.fromtimestamp(epoch, tz=tz)
+        utc_dt   = datetime.fromtimestamp(epoch, tz=ZoneInfo("UTC"))
+
+        LOG.step(f"Setting RTC wake alarm: epoch {epoch}")
+        set_wakealarm(epoch)
+
+        print(
+            f"pipower: RTC wake alarm set → "
+            f"{local_dt.strftime('%Y-%m-%d %H:%M:%S %Z')} "
+            f"(UTC {utc_dt.strftime('%H:%M:%S')}, epoch {epoch})"
+        )
+    except Exception as e:
+        # Log the error but exit 0 — the system must not be prevented from halting
+        print(f"pipower: ERROR setting wake alarm: {e}", file=sys.stderr)
+        sys.exit(0)
+
+
+def cmd_post_boot(args):
+    """
+    Internal handler called by pipower-alarm.service ExecStart on every boot.
+
+    NOT intended for direct user invocation. Runs early in the boot sequence
+    to check whether the system woke from a scheduled test alarm.
+
+    Detection logic:
+        1. Load config and check whether test_epoch is set (non-None).
+        2. If set, compare the current system boot time (from /proc/uptime)
+           against the stored test_epoch.
+        3. If boot time is within TEST_WAKE_TOLERANCE_SECS of test_epoch,
+           the system successfully woke from the test alarm. Set tested=True
+           and clear test_epoch.
+        4. If no match, leave config unchanged — this is a normal boot
+           unrelated to a test alarm.
+
+    Always exits 0 to avoid blocking the boot sequence, even on errors.
+
+    Args:
+        args: argparse.Namespace — no subcommand-specific arguments.
+
+    Exits:
+        0: Always.
+    """
+    LOG.step("_post-boot: checking for test wake confirmation")
+    require_root()
+
+    try:
+        cfg = load_config()
+    except SystemExit:
+        # Config missing — nothing to check, exit cleanly
+        sys.exit(0)
+
+    test_epoch = cfg.get("test_epoch")
+    if not test_epoch:
+        LOG.debug("No test_epoch in config — normal boot, nothing to confirm")
+        sys.exit(0)
+
+    # Read system boot time: current time minus uptime gives the boot epoch
+    try:
+        with open("/proc/uptime") as f:
+            uptime_secs = float(f.read().split()[0])
+        boot_epoch = int(time.time() - uptime_secs)
+        LOG.debug(f"Boot epoch:  {boot_epoch} "
+                  f"({datetime.fromtimestamp(boot_epoch).strftime('%H:%M:%S')})")
+        LOG.debug(f"Test epoch:  {test_epoch} "
+                  f"({datetime.fromtimestamp(test_epoch).strftime('%H:%M:%S')})")
+        LOG.debug(f"Difference:  {abs(boot_epoch - test_epoch)}s "
+                  f"(tolerance: {TEST_WAKE_TOLERANCE_SECS}s)")
+    except Exception as e:
+        LOG.debug(f"Could not read uptime: {e}")
+        sys.exit(0)
+
+    if abs(boot_epoch - test_epoch) <= TEST_WAKE_TOLERANCE_SECS:
+        # Boot time matches test_epoch — this was a successful test wake
+        print("pipower: test wake confirmed ✓ — marking installation as tested")
+        cfg["tested"]     = True
+        cfg["test_epoch"] = None   # clear so subsequent boots don't re-trigger
+        save_config(cfg)
+        print("pipower: run 'sudo pipower enable' to activate scheduled wake/sleep")
+    else:
+        LOG.debug("Boot time does not match test_epoch — not a test wake")
+
+    sys.exit(0)
+
+
+def cmd_reset_test(args):
+    """
+    Clear the tested flag, requiring the test cycle to be run again.
+
+    Useful if the hardware configuration changes (e.g. battery replaced,
+    EEPROM updated) and the test should be re-validated. Also clears any
+    stale test_epoch that may have been left from an interrupted test.
+
+    Args:
+        args: argparse.Namespace — no subcommand-specific arguments.
+
+    Raises:
+        SystemExit(1): If not running as root.
+    """
+    LOG.step("Resetting test status")
+    require_root()
+    cfg = load_config()
+
+    was_tested = cfg.get("tested", False)
+    cfg["tested"]     = False
+    cfg["test_epoch"] = None
+    save_config(cfg)
+
+    if was_tested:
+        print("Test status cleared. Run 'sudo pipower test-alarm --halt' to re-test.")
+    else:
+        print("Test status was already cleared.")
+    print("Note: if pipower is currently enabled, disable it first:")
+    print("  sudo pipower disable")
+    """
+    Set the RTC wake alarm for the next wake_time, then initiate poweroff.
+
+    Preferred over running `sudo shutdown -h now` directly because it
+    explicitly sets and confirms the wake alarm before halting, and
+    provides a 3-second cancellation window. The underlying alarm guard
+    service (pipower-alarm.service ExecStop) will also fire during the
+    subsequent poweroff sequence and set the alarm a second time — this
+    is harmless as the same epoch value is written.
+
+    If pipower is disabled, warns the user and prompts for confirmation
+    (bypassed with --force).
+
+    Args:
+        args: argparse.Namespace with attribute:
+            force (bool): If True, skip the confirmation prompt when
+                          pipower is disabled and proceed with shutdown.
+
+    Raises:
+        SystemExit(1): If not running as root.
+        SystemExit(0): If the user cancels at the countdown prompt.
+    """
+    LOG.step("Starting shutdown sequence")
+    require_root()
+    cfg = load_config()
+
+    if not cfg.get("enabled"):
+        print("Warning: pipower is disabled. Alarm will NOT be set.")
+        LOG.debug("pipower disabled — skipping wake alarm")
+        if not args.force:
+            answer = input("Proceed with shutdown anyway? [y/N]: ").strip().lower()
+            if answer != "y":
+                print("Shutdown cancelled.")
+                sys.exit(0)
+    else:
+        LOG.step(f"Computing next wake epoch for {cfg['wake_time']} {cfg['timezone']}")
+        epoch    = next_wake_epoch(cfg["wake_time"], cfg["timezone"])
+        tz       = ZoneInfo(cfg["timezone"])
+        local_dt = datetime.fromtimestamp(epoch, tz=tz)
+        LOG.debug(f"Wake epoch: {epoch} ({local_dt.strftime('%Y-%m-%d %H:%M:%S %Z')})")
+        try:
+            set_wakealarm(epoch)
+            print(f"RTC wake alarm set for {local_dt.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+        except Exception as e:
+            print(f"Warning: Could not set wake alarm: {e}", file=sys.stderr)
+
+    # 3-second countdown allows Ctrl+C cancellation before poweroff
+    print("Initiating poweroff in 3 seconds... (Ctrl+C to cancel)")
+    try:
+        time.sleep(3)
+    except KeyboardInterrupt:
+        print("\nShutdown cancelled.")
+        sys.exit(0)
+
+    LOG.step("Calling systemctl poweroff")
+    subprocess.run(["systemctl", "poweroff"])
+
+
+def cmd_test_alarm(args):
+    """
+    Set a short test wake alarm and optionally halt the system.
+
+    Intended for verifying the full halt→wake cycle works before enabling
+    the production schedule. When --halt is supplied, stores the wake epoch
+    as test_epoch in the config before halting. On the next boot,
+    `pipower _post-boot` reads this value and, if the boot time matches,
+    sets tested=True — gating `pipower enable`.
+
+    The test gate means `pipower enable` will refuse to activate unless
+    this command has been run with --halt and the system successfully woke
+    from the alarm. This prevents the shutdown loop failure mode seen when
+    enable is run without first verifying the halt→wake mechanism works.
+
+    Args:
+        args: argparse.Namespace with attributes:
+            minutes (int): Number of minutes from now to set the alarm.
+                           Default 5. Must be positive.
+            halt   (bool): If True, stores test_epoch and initiates poweroff.
+                           If False, only sets the alarm without halting
+                           (tested flag will NOT be set in this case).
+
+    Raises:
+        SystemExit(1): If not running as root, or if set_wakealarm fails.
+        SystemExit(0): If the user cancels at the halt countdown.
+    """
+    LOG.step(f"Setting TEST wake alarm {args.minutes} minute(s) from now")
+    require_root()
+    cfg     = load_config()
+    minutes = args.minutes
+
+    LOG.step(f"Resolving timezone: {cfg['timezone']}")
+    tz      = ZoneInfo(cfg["timezone"])
+    wake_dt = datetime.now(tz) + timedelta(minutes=minutes)
+    epoch   = int(wake_dt.timestamp())
+
+    LOG.debug(f"Now:        {datetime.now(tz).strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    LOG.debug(f"Wake epoch: {epoch}")
+
+    print(f"Setting TEST wake alarm:")
+    print(f"  Wake at:  {wake_dt.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    print(f"  Epoch:    {epoch}")
+    print(f"  Minutes:  {minutes}")
+
+    try:
+        set_wakealarm(epoch)
+        print(f"  Written:  {WAKEALARM_PATH}")
+    except Exception as e:
+        print(f"Error setting alarm: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Readback verification — confirms the kernel accepted the write
+    LOG.step("Verifying alarm write via sysfs readback")
+    actual = read_wakealarm()
+    LOG.debug(f"Readback value: {actual}, expected: {epoch}")
+    if actual == epoch:
+        print(f"  Verified: alarm confirmed in sysfs ✓")
+    else:
+        print(f"  Warning:  sysfs shows {actual}, expected {epoch}")
+
+    if args.halt:
+        # Store test_epoch in config BEFORE halting so _post-boot can
+        # confirm the wake on the next boot. Also clear any previous
+        # tested state so this test run supersedes the last one.
+        LOG.step("Storing test_epoch in config before halt")
+        cfg["test_epoch"] = epoch
+        cfg["tested"]     = False   # re-validate — previous test may be stale
+        save_config(cfg)
+        print(f"\nTest epoch stored in config.")
+        print(f"On wake, run 'sudo pipower status' to confirm tested=True.")
+
+        # 5-second window allows Ctrl+C if the alarm was set too short
+        print(f"\nHalting system in 5 seconds...")
+        print(f"Pi should power on around {wake_dt.strftime('%H:%M:%S %Z')}")
+        print("Ctrl+C to cancel.")
+        try:
+            time.sleep(5)
+        except KeyboardInterrupt:
+            # User cancelled — clear test_epoch so config is not left dirty
+            print("\nHalt cancelled. Clearing test_epoch from config.")
+            cfg["test_epoch"] = None
+            save_config(cfg)
+            sys.exit(0)
+        LOG.step("Calling systemctl poweroff")
+        subprocess.run(["systemctl", "poweroff"])
+    else:
+        print(f"\nAlarm set. System NOT halted (add --halt to also halt).")
+        print(f"Note: tested flag is only set when --halt is used and the")
+        print(f"      Pi successfully wakes from the alarm.")
+        print(f"To halt manually: sudo systemctl poweroff")
+        print(f"To clear alarm:   sudo sh -c 'echo 0 > {WAKEALARM_PATH}'")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    """
+    CLI entry point — parse arguments, configure logging, dispatch command.
+
+    Builds the argparse hierarchy with a top-level parser for global flags
+    (--verbose, --debug, --version) and subparsers for each command. After
+    parsing, configures the module-level LOG object so all downstream
+    functions emit the correct output level, then dispatches to the
+    appropriate cmd_* function via a name→function dict.
+
+    Global flags must appear before the subcommand name on the CLI:
+        sudo pipower -v status       ✓
+        sudo pipower status -v       ✗  (argparse will reject this)
+
+    The dispatch dict maps subcommand name strings to handler functions.
+    Adding a new subcommand requires: a new sub.add_parser() call, a new
+    cmd_* function, and a new entry in the dispatch dict.
+
+    The internal '_pre-shutdown' subcommand is registered with
+    help=argparse.SUPPRESS so it is hidden from `pipower --help` output
+    but still callable by systemd's ExecStop directive.
+    """
+    parser = argparse.ArgumentParser(
+        description=f"pipower {VERSION} — Raspberry Pi 5 RTC scheduled power management",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+commands:
+  install       Install systemd units and create default config
+  uninstall     Remove systemd units (config preserved)
+  set           Update wake/sleep times and/or timezone
+  test-alarm    Set a test alarm N minutes from now (--halt to also halt)
+  enable        Enable scheduled wake/sleep cycle (requires test first)
+  disable       Disable scheduled shutdown (alarm service remains active)
+  status        Show configuration, timer, and RTC alarm status
+  shutdown      Set alarm then poweroff (use instead of 'sudo shutdown')
+  reset-test    Clear tested flag to require re-testing
+
+examples:
+  sudo pipower install
+  sudo pipower set --wake 06:30 --sleep 22:00 --timezone America/Toronto
+  sudo pipower test-alarm --minutes 5 --halt
+  # (Pi halts and wakes — then SSH back in)
+  sudo pipower status                  # confirm Tested: Yes
+  sudo pipower enable
+  sudo pipower -v status
+  sudo pipower -d test-alarm --minutes 3 --halt
+  sudo pipower shutdown
+        """,
+    )
+    parser.add_argument("--version", action="version", version=f"pipower {VERSION}")
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Print step-by-step progress as each command executes"
+    )
+    parser.add_argument(
+        "-d", "--debug",
+        action="store_true",
+        help="Print low-level debug detail (implies --verbose)"
+    )
+
+    sub = parser.add_subparsers(dest="command", metavar="command")
+
+    sub.add_parser("install", help="Install pipower")
+    sub.add_parser("uninstall", help="Remove systemd units")
+
+    p_set = sub.add_parser("set", help="Update configuration")
+    p_set.add_argument("--wake", metavar="HH:MM", help="Wake time (24h)")
+    p_set.add_argument("--sleep", metavar="HH:MM", help="Shutdown time (24h)")
+    p_set.add_argument("--timezone", metavar="TZ", help="Timezone name (e.g. America/Toronto)")
+
+    sub.add_parser("enable", help="Enable scheduled cycle (requires test first)")
+    sub.add_parser("disable", help="Disable scheduled cycle")
+    sub.add_parser("status", help="Show status")
+    sub.add_parser("reset-test", help="Clear tested flag to require re-testing")
+
+    p_shutdown = sub.add_parser("shutdown", help="Set alarm + poweroff")
+    p_shutdown.add_argument(
+        "--force", action="store_true",
+        help="Proceed with shutdown even if pipower is disabled"
+    )
+
+    p_test = sub.add_parser("test-alarm", help="Set a test RTC alarm")
+    p_test.add_argument("--minutes", type=int, default=5, metavar="N",
+                        help="Minutes until wake (default: 5)")
+    p_test.add_argument("--halt", action="store_true",
+                        help="Also halt after setting alarm")
+
+    # Internal — called by systemd, hidden from help
+    sub.add_parser("_post-boot",    help=argparse.SUPPRESS)
+    sub.add_parser("_pre-shutdown", help=argparse.SUPPRESS)
+
+    args = parser.parse_args()
+
+    # Configure global logger before dispatching
+    LOG.configure(verbose=args.verbose, debug=args.debug)
+
+    if LOG.debug_on:
+        LOG.debug(f"pipower {VERSION} starting")
+        LOG.debug(f"Command: {args.command}")
+        LOG.debug(f"Flags:   verbose={args.verbose}  debug={args.debug}")
+        LOG.debug(f"Python:  {sys.version}")
+        LOG.debug(f"UID:     {os.getuid()}")
+
+    dispatch = {
+        "install":       cmd_install,
+        "uninstall":     cmd_uninstall,
+        "set":           cmd_set,
+        "enable":        cmd_enable,
+        "disable":       cmd_disable,
+        "status":        cmd_status,
+        "shutdown":      cmd_shutdown,
+        "test-alarm":    cmd_test_alarm,
+        "reset-test":    cmd_reset_test,
+        "_post-boot":    cmd_post_boot,
+        "_pre-shutdown": cmd_pre_shutdown,
+    }
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    dispatch[args.command](args)
+
+
+if __name__ == "__main__":
+    main()
