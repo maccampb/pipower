@@ -41,6 +41,18 @@ hardware RTC every 11 minutes, ensuring wake alarm epochs are accurate.
 
 Version: V2.0
 Changelog:
+  V2.5 - BUGFIX: ExecStop on pipower-alarm.service not reliably called
+         when shutdown is triggered from within a systemd service.
+         Fix: pipower-shutdown.service now explicitly calls
+         `pipower _pre-shutdown` before `systemctl poweroff`, removing
+         dependence on ExecStop for alarm setting. ExecStop retained
+         as a safety net for manual shutdowns only.
+  V2.4 - Added persistent file-based shutdown/boot logging to
+         /var/log/pipower.log. _pre-shutdown and _post-boot now
+         append a timestamped entry regardless of systemd journal
+         state. Diagnoses missed wake alarms without persistent journal.
+         Also added TimeoutStopSec=30 to alarm service unit to ensure
+         ExecStop has sufficient time to complete before halt.
   V2.3 - BUGFIX: Root cause of immediate shutdown identified and fixed.
          Removed `Requires=pipower-shutdown.service` from timer [Unit]
          section. systemd activates Requires= dependencies immediately
@@ -98,7 +110,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION      = "V2.3"
+VERSION      = "V2.5"
 
 # Script install location — /usr/local/bin is correct per FHS for locally-
 # administered tools that depend on system components (Python, systemd).
@@ -114,6 +126,10 @@ CONFIG_FILE  = CONFIG_DIR / "config.json"
 # at that time after a halt. Must be cleared (write "0") before writing
 # a new value — the kernel driver requires this two-step sequence.
 WAKEALARM_PATH = Path("/sys/class/rtc/rtc0/wakealarm")
+
+# Persistent log file — written at every shutdown and boot regardless of
+# systemd journal state. Survives reboots. Readable without journalctl.
+LOG_FILE = Path("/var/log/pipower.log")
 
 # systemd unit directory — all three pipower units live here.
 SYSTEMD_DIR  = Path("/etc/systemd/system")
@@ -521,6 +537,33 @@ def systemctl(*args, check: bool = True, capture: bool = False):
 
 
 # ---------------------------------------------------------------------------
+# Persistent file logger
+# ---------------------------------------------------------------------------
+
+def log_event(event: str, detail: str = ""):
+    """
+    Append a timestamped event entry to LOG_FILE (/var/log/pipower.log).
+
+    Called from _pre-shutdown and _post-boot so there is always a record
+    of shutdown and wake activity regardless of systemd journal persistence.
+    Failures are silently ignored — logging must never block or error out
+    during a shutdown sequence.
+
+    Args:
+        event:  Short event label, e.g. "SHUTDOWN", "WAKE", "ALARM_SET".
+        detail: Optional additional context, e.g. the alarm epoch/datetime.
+    """
+    try:
+        ts = datetime.now(ZoneInfo("UTC")).strftime("%Y-%m-%d %H:%M:%S UTC")
+        line = f"{ts}  {event:<16} {detail}\n"
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(LOG_FILE, "a") as f:
+            f.write(line)
+    except Exception:
+        pass   # never raise from a log call
+
+
+# ---------------------------------------------------------------------------
 # Systemd unit generators
 # ---------------------------------------------------------------------------
 #
@@ -572,6 +615,7 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart={INSTALL_BIN} _post-boot
 ExecStop={INSTALL_BIN} _pre-shutdown
+TimeoutStopSec=30
 
 [Install]
 WantedBy=multi-user.target
@@ -624,13 +668,21 @@ def shutdown_service_content() -> str:
     """
     Generate the content for pipower-shutdown.service.
 
-    A minimal one-shot service triggered by the timer. Its only job is
-    to call `systemctl poweroff`, which initiates the normal systemd
-    shutdown sequence — which in turn triggers pipower-alarm.service's
-    ExecStop to set the RTC wake alarm before halt completes.
+    Triggered by pipower-shutdown.timer at the configured sleep_time.
+    Explicitly calls `pipower _pre-shutdown` via ExecStartPre to set the
+    RTC wake alarm BEFORE calling `systemctl poweroff`.
 
-    DefaultDependencies=no prevents ordering conflicts with the shutdown
-    targets that this service is itself initiating.
+    This is the primary alarm-setting path for scheduled shutdowns.
+    Calling _pre-shutdown directly here — rather than relying solely on
+    pipower-alarm.service ExecStop — avoids a known systemd ordering issue
+    where ExecStop may not be called when poweroff is initiated from within
+    a service unit.
+
+    pipower-alarm.service ExecStop is retained as a safety net for manual
+    shutdowns (sudo shutdown, sudo halt, sudo pipower shutdown).
+
+    ExecStartPre uses `-` prefix so poweroff proceeds even if _pre-shutdown
+    exits non-zero — the system must always halt regardless of alarm status.
 
     Returns:
         str: Complete systemd service unit file content ready to write to disk.
@@ -639,10 +691,10 @@ def shutdown_service_content() -> str:
 [Unit]
 Description=pipower - Execute scheduled poweroff
 DefaultDependencies=no
-After=pipower-alarm.service
 
 [Service]
 Type=oneshot
+ExecStartPre=-{INSTALL_BIN} _pre-shutdown
 ExecStart=/bin/systemctl poweroff
 """
 
@@ -1233,18 +1285,21 @@ def cmd_pre_shutdown(args):
         0: Always. Any error condition exits 0 to not block shutdown.
     """
     LOG.step("_pre-shutdown triggered by systemd ExecStop")
+    log_event("SHUTDOWN_START", "ExecStop triggered by systemd")
     require_root()
 
     try:
         cfg = load_config()
     except SystemExit:
         # Config missing — log and exit cleanly so shutdown is not blocked
+        log_event("SHUTDOWN_SKIP", "config not found")
         print("pipower: config not found, skipping wake alarm.", file=sys.stderr)
         sys.exit(0)
 
     LOG.debug(f"enabled={cfg.get('enabled')}")
     if not cfg.get("enabled"):
         # Pipower is disabled — don't set an alarm, exit cleanly
+        log_event("SHUTDOWN_SKIP", "pipower disabled")
         print("pipower: disabled — wake alarm not set.")
         sys.exit(0)
 
@@ -1258,6 +1313,9 @@ def cmd_pre_shutdown(args):
         LOG.step(f"Setting RTC wake alarm: epoch {epoch}")
         set_wakealarm(epoch)
 
+        alarm_str = (f"{local_dt.strftime('%Y-%m-%d %H:%M:%S %Z')} "
+                     f"(epoch {epoch})")
+        log_event("ALARM_SET", alarm_str)
         print(
             f"pipower: RTC wake alarm set → "
             f"{local_dt.strftime('%Y-%m-%d %H:%M:%S %Z')} "
@@ -1265,6 +1323,7 @@ def cmd_pre_shutdown(args):
         )
     except Exception as e:
         # Log the error but exit 0 — the system must not be prevented from halting
+        log_event("ALARM_ERROR", str(e))
         print(f"pipower: ERROR setting wake alarm: {e}", file=sys.stderr)
         sys.exit(0)
 
@@ -1295,6 +1354,7 @@ def cmd_post_boot(args):
         0: Always.
     """
     LOG.step("_post-boot: checking for test wake confirmation")
+    log_event("BOOT", f"system boot detected (pipower {VERSION})")
     require_root()
 
     try:
@@ -1326,6 +1386,7 @@ def cmd_post_boot(args):
     if abs(boot_epoch - test_epoch) <= TEST_WAKE_TOLERANCE_SECS:
         # Boot time matches test_epoch — this was a successful test wake
         print("pipower: test wake confirmed ✓ — marking installation as tested")
+        log_event("TEST_WAKE_OK", f"boot matched test_epoch {test_epoch} — tested=True")
         cfg["tested"]     = True
         cfg["test_epoch"] = None   # clear so subsequent boots don't re-trigger
         save_config(cfg)
@@ -1521,6 +1582,37 @@ def cmd_test_alarm(args):
 # Entry point
 # ---------------------------------------------------------------------------
 
+def cmd_log(args):
+    """
+    Display the contents of the persistent pipower log file.
+
+    The log file (/var/log/pipower.log) is appended to by _pre-shutdown
+    and _post-boot on every shutdown and boot, independent of the systemd
+    journal. This provides a reliable record of alarm activity even when
+    the journal is not persistent.
+
+    Args:
+        args: argparse.Namespace with attribute:
+            lines (int): Number of most recent lines to show (default: 20).
+    """
+    if not LOG_FILE.exists():
+        print(f"No log file found at {LOG_FILE}")
+        print("The log is created on the first shutdown after V2.4 is installed.")
+        return
+
+    try:
+        lines = LOG_FILE.read_text().splitlines()
+        n = args.lines
+        shown = lines[-n:] if len(lines) > n else lines
+        print(f"pipower log — {LOG_FILE} (last {len(shown)} of {len(lines)} entries)")
+        print("─" * 60)
+        for line in shown:
+            print(line)
+        print("─" * 60)
+    except Exception as e:
+        print(f"Error reading log: {e}", file=sys.stderr)
+
+
 def main():
     """
     CLI entry point — parse arguments, configure logging, dispatch command.
@@ -1557,6 +1649,7 @@ commands:
   status        Show configuration, timer, and RTC alarm status
   shutdown      Set alarm then poweroff (use instead of 'sudo shutdown')
   reset-test    Clear tested flag to require re-testing
+  log           Show persistent shutdown/boot log
 
 examples:
   sudo pipower install
@@ -1597,6 +1690,10 @@ examples:
     sub.add_parser("status", help="Show status")
     sub.add_parser("reset-test", help="Clear tested flag to require re-testing")
 
+    p_log = sub.add_parser("log", help="Show persistent shutdown/boot log")
+    p_log.add_argument("--lines", type=int, default=20, metavar="N",
+                       help="Number of recent log lines to show (default: 20)")
+
     p_shutdown = sub.add_parser("shutdown", help="Set alarm + poweroff")
     p_shutdown.add_argument(
         "--force", action="store_true",
@@ -1635,6 +1732,7 @@ examples:
         "shutdown":      cmd_shutdown,
         "test-alarm":    cmd_test_alarm,
         "reset-test":    cmd_reset_test,
+        "log":           cmd_log,
         "_post-boot":    cmd_post_boot,
         "_pre-shutdown": cmd_pre_shutdown,
     }
